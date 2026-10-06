@@ -162,3 +162,57 @@ else:
 print("当前登记值是否达标:", d["satisfied"],
       "| 当前 uc(y) =", d["current_combined_standard_uncertainty"]["value"])
 PY
+
+echo "== 9. 首个探针越过定义域（y=1+asin(x)，x0=1-5e-9，上界约 1e-9）=="
+# 初始对称步长 h0≈6e-6 > 到 asin 右边界的距离 5e-9：域内缩步取双侧中心
+# 差分（g≈1e4；大步单侧一阶差分只有 ~558，曲率误差 94%，不采用）
+curl -sS -X POST "$BASE/api/v1/models" -H 'Content-Type: application/json' -d '{
+  "version": "budget-asin-edge",
+  "name": "定义域右边界附近 y=1+asin(x)",
+  "expression": "1 + asin(x)",
+  "inputs": [
+    {"name": "x", "value": 0.999999995, "unit": "dimensionless", "standard_uncertainty": 1e-10, "distribution": "normal"}
+  ],
+  "output_unit": "dimensionless"
+}' -o /dev/null -w "model  : HTTP %{http_code}\n" || true
+
+curl -sS -X POST "$BASE/api/v1/precision-budgets" -H 'Content-Type: application/json' -d '{
+  "model_version": "budget-asin-edge",
+  "input_name": "x",
+  "target": {"standard_uncertainty": 1e-5, "unit": "dimensionless"}
+}' -o /tmp/budget_asin_resp.json -w "budget : HTTP %{http_code}\n"
+
+python3 - <<'PY'
+import json
+d = json.load(open('/tmp/budget_asin_resp.json'))
+iv = d["interval"]
+g = d["sensitivity"]["coefficient"]
+print("灵敏度:", g, "（真实 1/sqrt(1-x0^2)≈1e4，有限正；旧实现此处 422）")
+assert 9999.0 < g < 10001.0
+if iv["unbounded_upper"]:
+    print("错误：有限预算被判为无上界")
+else:
+    lo = "[" if iv["lower_inclusive"] else "("
+    hi = "]" if iv["upper_inclusive"] else ")"
+    print(f"可行 ux 区间: {lo}{iv['lower']}, {iv['upper']}{hi}  （理论 [0, 1e-9]，闭区间）")
+print("当前登记值是否达标:", d["satisfied"],
+      "| 当前 uc(y) =", d["current_combined_standard_uncertainty"]["value"])
+PY
+
+echo "== 10. 同模型 GUM+MC 传播（修复前 422，期望 HTTP 201）=="
+curl -sS -X POST "$BASE/api/v1/evaluations" -H 'Content-Type: application/json' -d '{
+  "model_version": "budget-asin-edge",
+  "inputs": [
+    {"name": "x", "value": 0.999999995, "unit": "dimensionless", "standard_uncertainty": 1e-10, "distribution": "normal"}
+  ],
+  "correlations": [],
+  "n": 5000, "seed": 20261006, "idempotency_key": "asin-edge-eval-0001"
+}' -o /tmp/eval_asin_resp.json -w "eval   : HTTP %{http_code}\n"
+
+python3 - <<'PY'
+import json
+d = json.load(open('/tmp/eval_asin_resp.json'))
+g, m = d["result"]["combined"]["gum"], d["result"]["combined"]["monte_carlo"]
+print(f"GUM : {g['value']:.6f} ± {g['standard_uncertainty']:.3e} {g['unit']}（理论 g·ux ≈ 1e-6）")
+print(f"MC  : {m['mean']:.6f} ± {m['standard_uncertainty']:.3e} {m['unit']}（无抽样越界，正常收敛）")
+PY

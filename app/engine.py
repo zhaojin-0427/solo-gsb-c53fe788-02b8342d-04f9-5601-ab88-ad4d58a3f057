@@ -330,9 +330,26 @@ def numerical_gradient_with_noise(
     增长 64 倍的特征），回退采用漂移前的小步长，避免在高曲率零名义点
     把截断伪影当成灵敏度。放大后的步长若越过模型定义域（如 ``sqrt(x)``
     在极小正名义点处 x-h < 0 产生 NaN），立即停止放大并保留上一个有限
-    步长（初始 h0 就非有限时依旧抛错，与历史行为一致）。真正零/无扰动
-    方向（f+ == f- 恒成立，如 ``2*(a-a)``）逐级放大到上限仍不可辨，
-    梯度保持 0.0，噪声按最终步长（只会更严格）计算。
+    步长（初始步长就非有限时进入下面的“首个探针越界”流程，不再直接
+    抛错）。真正零/无扰动方向（f+ == f- 恒成立，如 ``2*(a-a)``）逐级
+    放大到上限仍不可辨，梯度保持 0.0，噪声按最终步长（只会更严格）计算。
+
+    **首个对称探针越过定义域：域内缩步。** 初始步长
+    ``h0 = eps^(1/3)·max(|x0|, eps^(1/3))`` 是为中心差分截断/舍入平衡
+    选择的，与名义点到定义域边界的距离无关——名义点本身有效但距边界
+    极近时（如 ``1 + asin(x)`` 在 x0 = 1-5e-9 处，x0 + h0 > 1），首个
+    对称探针就会越过定义域产生 NaN。旧实现把该 NaN 直接抛成
+    PropagationError（登记成功却无法 GUM/反求，返回 422），属于错误
+    拒绝：名义点有效时，只要浮点可分辨且在有效域内，就必须选得到探针。
+    因此当首个探针非有限而 f(x0) 有限时，改为按 8 倍几何**缩小**步长，
+    直到两侧都落在域内；随后继续缩小（与放大流程相反的方向）直到相邻
+    梯度的截断漂移被自身舍入噪声吞没，在截断误差 O(h²) 与舍入误差
+    O(eps/h) 的平衡尺度取值。绝不使用大步单侧一阶差分
+    ``(f(x0)−f(x0−h))/h`` 代替：其截断误差是 O(h)，在高曲率的边界点
+    （asin 在 x→1⁻ 处斜率发散）可把 ~1e4 的真实斜率低估一个数量级以上。
+    若步长已缩到浮点不可分（``x0±h`` 与 x0 同表示）仍无双侧有限探针
+    （名义点恰好钉在边界上），才保留 422 拒绝——这不是“名义点有效”
+    的情形（任何非零扰动都越界，GUM 一阶传播无定义）。
 
     **定义域边界截断时的单侧确认。** 中心差分扩步可能被定义域提前截断
     （如 ``1.0 + 1e-10*sqrt(x)`` 在 x0 = 1e-8 处：h 稍大于 x0 即 x-h < 0，
@@ -347,6 +364,12 @@ def numerical_gradient_with_noise(
     两个方向都尝试（左边界如 sqrt/log 用 +h，右边界如 asin 在 x→1⁻
     用 −h）；两个方向到 h_cap 都不可辨（如 ``0.0*sqrt(x)`` 差值恒为 0）
     才维持零结论。
+
+    **首个探针即越界（如上条的右边界镜像）。** 若不是“扩步被截断”
+    而是初始 h0 的对称探针本身就非有限（名义点有效但距边界距离 < h0，
+    如 ``1 + asin(x)`` 在 x0 = 1-5e-9 处 x0+h0 > 1），先域内缩步取到
+    双侧中心差分（见上条“首个对称探针越过定义域”）；缩步后若差分被
+    偏置淹没仍不可辨，同样走单侧确认（asin 右边界用 −h 方向）。
     """
     grad = np.zeros(len(names))
     noise = np.zeros(len(names))
@@ -361,9 +384,10 @@ def numerical_gradient_with_noise(
             env_minus = dict(x_base)
             env_plus[name] = x0 + step
             env_minus[name] = x0 - step
-            # 放大后的步长可能越过模型定义域（如 sqrt/log 在 x-h < 0 处给
-            # NaN）：NaN 会被 _evaluate_scalar 转成 PropagationError 由外层
-            # 捕获，告警本身无意义，压掉避免污染日志（与 MC 路径一致）。
+            # 放大/缩小后的步长可能越过模型定义域（如 sqrt/log 在 x-h < 0
+            # 处给 NaN、asin 在 x+h > 1 处给 NaN）：NaN 会被 _evaluate_scalar
+            # 转成 PropagationError 由外层捕获，告警本身无意义，压掉避免污染
+            # 日志（与 MC 路径一致）。
             with np.errstate(all="ignore"):
                 yp = _evaluate_scalar(compiled, env_plus)
                 ym = _evaluate_scalar(compiled, env_minus)
@@ -371,8 +395,27 @@ def numerical_gradient_with_noise(
             resolved = abs(yp - ym) > GRADIENT_RESOLUTION_FACTOR * _EPS * max(abs(yp), abs(ym))
             return yp, ym, g, resolved
 
-        # 初始 h0 非有限（NaN/Inf，定义域被越过）：直接抛错（历史行为）
-        yp, ym, g, resolved = probe(h)
+        # 名义点本身非有限（NaN/Inf，模型在登记点即无定义）：直接抛错
+        # （历史语义：无效名义点仍拒绝，不进入任何探针流程）。
+        with np.errstate(all="ignore"):
+            f0 = _evaluate_scalar(compiled, x_base)
+
+        # 初始 h0 的对称探针非有限（抛错或静默 NaN/Inf）：名义点有效但
+        # 首个探针越过定义域（如 1+asin(x) 在 x0=1-5e-9 处 x0+h0>1）。
+        # 按 8 倍几何缩步直到双侧都在域内，再缩到截断/舍入平衡尺度
+        # （漂移回升即停）；缩到浮点不可分仍无双侧有限探针（名义点恰钉
+        # 在边界）才拒绝。
+        first_failed = False
+        try:
+            yp, ym, g, resolved = probe(h)
+            if not (math.isfinite(yp) and math.isfinite(ym)):
+                first_failed = True
+        except PropagationError:
+            first_failed = True
+        if first_failed:
+            yp, ym, g, resolved, h = _shrink_probe_inside_domain(
+                compiled, x_base, name, x0, h, probe, f0
+            )
 
         # 阶段 1：差分值被输出舍入淹没 => 放大步长直到可辨或到达 h_cap
         grew = False
@@ -406,12 +449,104 @@ def numerical_gradient_with_noise(
         # 定义域边界截断且差分不可辨：用域内单侧探针确认输出是否真的
         # 依赖该输入（确认的是“非零”，斜率值仍用上面的中心差分估计）。
         if not resolved and blocked:
-            resolved = _onesided_dependence_resolved(compiled, x_base, name, x0, h, h_cap)
+            resolved = _onesided_dependence_resolved(
+                compiled, x_base, name, x0, h, h_cap, f0
+            )
 
         grad[k] = g
         noise[k] = _EPS * max(abs(yp), abs(ym)) / (2.0 * h)
         resolved_mask[k] = resolved
     return grad, noise, resolved_mask
+
+
+def _shrink_probe_inside_domain(
+    compiled: CompiledExpression,
+    x_base: Mapping[str, float],
+    name: str,
+    x0: float,
+    h0: float,
+    probe,
+    f0: float,
+) -> tuple[float, float, float, bool, float]:
+    """首个对称探针越过定义域时，在域内缩步选取中心差分探针。
+
+    名义点本身有效（f(x0) 有限）但距定义域边界极近，初始步长
+    ``h0 = eps^(1/3)·max(|x0|, eps^(1/3))``（截断/舍入平衡尺度，与边界
+    距离无关）使 x0±h0 一侧越界（如 ``1 + asin(x)`` 在 x0 = 1-5e-9 处
+    x0+h0 > 1，或 ``sqrt(x)`` 在 x0 << eps^(1/3) 处 x0-h0 < 0）。此时：
+
+    1. 按 :data:`_GRADIENT_STEP_GROWTH`（8 倍）几何缩小步长，直到
+       x0±h 双侧都落在域内（首个双侧有限探针；其截断误差偏大）；
+    2. 继续缩小，比较相邻步长梯度漂移：截断区漂移随缩小以 ~64 倍/级
+       下降，一旦漂移不降反升即舍入区（光滑函数两个差分点的舍入高度
+       相关，经典上界 eps·|f|/(2h) 过于保守，故用经验漂移回升裁决，
+       而非要求漂移低于该上界），采用回升前最后一个估计。
+
+    始终使用**双侧中心差分**（O(h²)），绝不用大步单侧一阶差分
+    （O(h)）：asin 在 x→1⁻ 处三阶导数发散，h ≈ h0 的单侧差分会把
+    ~1e4 的真实斜率低估一个数量级（曲率误差 ~94%）。
+
+    若步长已缩到一 ulp（``x0±h`` 与 x0 的相邻浮点表示重合，任何更小的
+    扰动都无法取到不同的点——名义点恰好钉在边界上），仍抛
+    :class:`PropagationError`：GUM 一阶线性化在此处无定义，保持“名义点
+    无效即拒绝”的原语义。返回 ``(yp, ym, g, resolved, h)``。
+    """
+    h = h0
+    result: tuple[float, float, float, bool] | None = None
+    # 一 ulp：小于它的 h 无法把 x0±h 取到与 x0 不同的浮点表示
+    h_ulp = math.ulp(abs(x0)) if x0 != 0.0 else _EPS
+
+    def points_distinct(step: float) -> bool:
+        """中心差分要求两个探针点都与名义点不同且彼此不同。"""
+        return x0 + step != x0 and x0 - step != x0 and x0 + step != x0 - step
+
+    # 阶段 1：缩小到首个双侧有限探针。每次先缩再探，循环中 h/8 必须仍
+    # 能取到与 x0 不同的点；否则（名义点恰钉在边界，如 asin 的 x0=1：
+    # 向内一侧最多一个 ulp、向外一侧必越界）保持拒绝。
+    while h / _GRADIENT_STEP_GROWTH >= h_ulp:
+        h /= _GRADIENT_STEP_GROWTH
+        if not points_distinct(h):
+            break
+        try:
+            with np.errstate(all="ignore"):
+                result = probe(h)
+            break
+        except PropagationError:
+            continue
+    if result is None:
+        raise PropagationError(
+            "模型在名义点处有效，但任何浮点可分辨的非零扰动都越过模型定义域"
+            "（名义点恰好位于定义域边界，如 asin 的 x=1）：GUM 一阶传播无定义"
+        )
+    yp, ym, g, resolved = result
+
+    # 阶段 2：继续缩小到截断误差与舍入误差的平衡尺度。与放大流程方向
+    # 相反——初始（被迫入域的）步长远超最优尺度，截断误差 O(h²) 随
+    # 缩小以 64 倍/级下降；越过平衡点后舍入误差 O(eps/h) 接管，相邻
+    # 梯度漂移不降反升。这里用**带前瞻的经验漂移**裁决：保留漂移首次
+    # 回升前的估计（不能只看单级漂移是否低于 eps·|f|/(2h)——光滑函数
+    # 两个差分点的舍入高度相关、会部分抵消，该经典上界过于保守，会在
+    # 平衡点之后继续缩步，得到被舍入主导的伪梯度；如 acos 在 x→1⁻ 处
+    # 缩到 ~1e-16 时梯度偏差达 5%~26%）。
+    drift_prev: float | None = None
+    while h > h_ulp:
+        hn = h / _GRADIENT_STEP_GROWTH
+        if hn <= h_ulp:
+            break
+        try:
+            with np.errstate(all="ignore"):
+                ypn, ymn, gn, rn = probe(hn)
+        except PropagationError:
+            break  # 进一步缩小反而越界（防御式）：采用当前步长
+        # 探针点必须与名义点不同且彼此不同，否则中心差分已退化
+        if not points_distinct(hn):
+            break
+        drift = abs(gn - g)
+        if drift_prev is not None and drift > drift_prev:
+            break  # 舍入开始主导（漂移回升）：采用上一级 (h, g)
+        h, yp, ym, g, resolved = hn, ypn, ymn, gn, rn
+        drift_prev = drift
+    return yp, ym, g, resolved, h
 
 
 def _onesided_dependence_resolved(
@@ -421,6 +556,7 @@ def _onesided_dependence_resolved(
     x0: float,
     h: float,
     h_cap: float,
+    f0: float | None = None,
 ) -> bool:
     """中心差分被定义域边界截断时，用域内单侧探针裁决输出是否依赖该输入。
 
@@ -439,7 +575,8 @@ def _onesided_dependence_resolved(
     真实斜率，斜率必须取边界内步长受控的中心差分估计。
     """
     with np.errstate(all="ignore"):
-        f0 = _evaluate_scalar(compiled, x_base)
+        if f0 is None:
+            f0 = _evaluate_scalar(compiled, x_base)
     for sign in (1.0, -1.0):
         step = h
         while step < h_cap:

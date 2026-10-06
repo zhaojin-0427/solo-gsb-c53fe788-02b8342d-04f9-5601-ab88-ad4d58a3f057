@@ -60,7 +60,7 @@ docker compose up --build -d
 
 SQLite 数据库保存在命名卷 `uncertainty-data`（容器内 `/data/uncertainty.db`），容器重建后数据仍在。
 
-全部接口随该命令一同启动（含只读的测量精度反求接口 `POST /api/v1/precision-budgets`，无需额外配置）；反求接口的调用示例见 [第 9 节](#9-测量精度反求precision-budgets)。
+全部接口随该命令一同启动（含只读的测量精度反求接口 `POST /api/v1/precision-budgets`，无需额外配置）；反求接口的调用示例见 [第 9 节](#9-测量精度反求precision-budgets)，其中 [9.8 节](#98-首个探针即越过定义域域内缩步取样asin-右边界闭区间-1e-9)给出定义域右边界模型 `y = 1 + asin(x)`（x0 = 1−5e-9）的一键复现命令与实际请求/响应：服务启动后依次执行该节的登记模型、精度反求、GUM 计算三条 `curl` 即可（无需任何额外容器或环境变量）。
 
 停止：
 
@@ -949,6 +949,138 @@ curl -sS -X POST http://localhost:8000/api/v1/precision-budgets \
 
 > 同一边界结构下的**真零斜率**（如 `y = 1.0 + 0.0*sqrt(x)`）单侧探针到 `h_cap` 差值恒为 0，仍判零：同样的请求返回 `[0, +∞)`（`upper=null`、`unbounded_upper=true`）——边界截断不改变真零方向的裁决。反求与 GUM 传播共用同一梯度路径：该模型的 `POST /api/v1/evaluations` 给出的 GUM 合成标准不确定度与上面响应中的 `current_combined_standard_uncertainty` 完全一致（5.20390617002552e-16）。
 
+#### 9.8 首个探针即越过定义域：域内缩步取样（asin 右边界，闭区间 ~1e-9）
+
+[9.7](#97-定义域边界截断差分扩步单侧探针确认斜率闭区间-02)处理的是“初始步长在域内、自适应**扩步**才被边界截断”（sqrt 左边界）；本节处理它的右边界镜像——**初始对称探针本身就越过定义域**。
+
+无量纲模型 `y = 1 + asin(x)`，名义点 `x0 = 0.999999995`（即 `1-5e-9`，本身有效：asin(1−5e-9) ≈ π/2 − 1e-4）、`ux = 1e-10`，目标 u(y) ≤ 1e-5，反求 x。真实斜率
+
+```
+g = 1/sqrt(1-x0²) ≈ 10000
+```
+
+理论可行区间 **ux ∈ [0, 1e-9]**（1e-5 / 1e4），当前 ux = 1e-10 时 uc ≈ 1e-6，达标。
+
+问题出在梯度探针的**初始对称步长**上：中心差分平衡截断/舍入的经典步长是
+
+```
+h0 = eps^(1/3)·max(|x0|, eps^(1/3)) ≈ 6.06e-6
+```
+
+它只与 `|x0|` 有关，与名义点到定义域边界的距离无关。而 x0 到 asin 右边界 1 的距离只有 5e-9 ≪ h0，于是首个对称探针 `x0 + h0 ≈ 1.000006 > 1` 立即产生 NaN，梯度引擎抛 `PropagationError`：**反求与 GUM 都返回 422**——尽管名义点本身完全有效。这是错误拒绝。
+
+修复在“浮点可分辨范围 ∩ 有效域”内选择探针，按以下次序裁决取样方式：
+
+1. **名义点 f(x0) 必须有限**；否则（如 x0 = 1.000000001）不进入任何探针流程，仍按原语义 422 拒绝；
+2. 首个对称探针越界时，从 h0 起按 8 倍几何**缩小步长**，直到 `x0±h` 两侧都落在域内（本例首个双侧有限步长 h ≈ 1.48e-9）；
+3. 继续缩小直到相邻梯度漂移不再下降（O(h²) 截断误差随缩小以 64 倍/级下降，越过平衡点后 O(eps/h) 舍入接管、漂移回升），在截断/舍入平衡尺度取**双侧中心差分**（O(h²)）。下限是一 ulp——小于它时 `x0±h` 与 x0 的相邻浮点表示重合，中心差分退化；
+4. **绝不用大步单侧一阶差分** `(f(x0)−f(x0−h0))/h0` 代替：它的截断误差是 O(h)，asin 在 x→1⁻ 处三阶导数发散，h ≈ h0 的单侧差分只有 **558**（相对真实斜率 1e4 低估 **94.4%**），是典型的大步曲率误差；
+5. 缩到一 ulp 仍无双侧有限探针（名义点**恰好钉在边界**，如 asin 的 x = 1：向内一侧最多一个 ulp、向外一侧必越界）时，GUM 一阶传播在该点无定义，仍返回 422；
+6. 缩步后的中心差分若被输出偏置淹没仍不可辨，再走 [9.7](#97-定义域边界截断差分扩步单侧探针确认斜率闭区间-02) 的域内单侧探针做“是否依赖”裁决（asin 右边界用 −h 方向）；同结构的真零斜率（`1 + 0.0*asin(x)`）差值恒为 0，仍判零。
+
+本例最终取 h ≈ 2.89e-12，g ≈ 10000.009（相对误差 ~9e-7）：
+
+```bash
+curl -sS -X POST http://localhost:8000/api/v1/models \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "version": "budget-asin-edge",
+    "name": "定义域右边界附近 y=1+asin(x)",
+    "expression": "1 + asin(x)",
+    "inputs": [
+      {"name": "x", "value": 0.999999995, "unit": "dimensionless",
+       "standard_uncertainty": 1e-10, "distribution": "normal"}
+    ],
+    "output_unit": "dimensionless"
+  }'
+# HTTP 201
+
+curl -sS -X POST http://localhost:8000/api/v1/precision-budgets \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model_version": "budget-asin-edge",
+    "input_name": "x",
+    "target": {"standard_uncertainty": 1e-5, "unit": "dimensionless"}
+  }'
+```
+
+返回 `200`（以下为**实际响应**）：有限正灵敏度 ≈ 10000，闭区间 **[0, 9.99999e-10]**（理论 1e-9），当前 ux = 1e-10 时 uc ≈ 1e-6 ≤ 1e-5，`satisfied=true`：
+
+```json
+{
+  "model_version": "budget-asin-edge",
+  "input_name": "x",
+  "input_unit": "dimensionless",
+  "target": {"standard_uncertainty": 1e-05, "unit": "dimensionless"},
+  "target_in_output_unit": {"standard_uncertainty": 1e-05, "unit": "dimensionless"},
+  "sensitivity": {"coefficient": 10000.008802911274, "unit": "dimensionless/dimensionless"},
+  "current_standard_uncertainty": {"value": 1e-10, "unit": "dimensionless"},
+  "current_combined_standard_uncertainty": {"value": 1.00000088e-06, "unit": "dimensionless"},
+  "satisfied": true,
+  "interval": {
+    "feasible": true,
+    "lower": 0.0,
+    "lower_inclusive": true,
+    "upper": 9.99999e-10,
+    "upper_inclusive": true,
+    "unbounded_upper": false
+  }
+}
+```
+
+同一梯度路径也被 GUM 使用——该模型现在可以正常提交 `POST /api/v1/evaluations`（N=5000，seed=20261006）：
+
+```bash
+curl -sS -X POST http://localhost:8000/api/v1/evaluations \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model_version": "budget-asin-edge",
+    "inputs": [
+      {"name": "x", "value": 0.999999995, "unit": "dimensionless",
+       "standard_uncertainty": 1e-10, "distribution": "normal"}
+    ],
+    "correlations": [],
+    "n": 5000, "seed": 20261006, "idempotency_key": "asin-edge-eval-0001"
+  }'
+```
+
+返回 `201`（**实际响应**节选）：GUM uc ≈ 1.00000088e-6（= g·ux，与反求响应逐位一致）；ux = 1e-10 意味着分布到右边界还有 50 个标准差余量，固定种子 MC 无抽样越界、正常收敛（MC 标准差 ≈ 1.0025e-6）：
+
+```json
+{
+  "result": {
+    "combined": {
+      "gum": {
+        "value": 2.570696326795159,
+        "standard_uncertainty": 1.00000088e-06,
+        "coverage_interval": {"low": 2.570694366829449, "high": 2.570698286760869},
+        "coverage_factor": 1.959963984540054,
+        "unit": "dimensionless"
+      },
+      "monte_carlo": {
+        "mean": 2.570696339205655,
+        "standard_uncertainty": 1.002509917e-06,
+        "coverage_interval": {"low": 2.570694378340406, "high": 2.570698243908622},
+        "samples_range": {"min": 2.570692902952105, "max": 2.570699890545745},
+        "unit": "dimensionless"
+      }
+    },
+    "sensitivities": {"x": {"coefficient": 10000.008802911274, "unit": "dimensionless/"}},
+    "convergence": {"n": 5000.0, "seed": 20261006.0, "converged": true}
+  }
+}
+```
+
+边界规则保持不变的场景：
+
+| 场景 | 处置 |
+| --- | --- |
+| 名义点有效、首个探针越界（asin x0=1−5e-9、acos 同、sqrt/log 小正名义点 h0>x0） | 域内缩步取双侧中心差分，反求/GUM 正常（200/201） |
+| 两侧都远离边界的内部点（如 x0 = 0.999） | 初始 h0 中心差分路径逐位不变 |
+| 同结构真零斜率（`1 + 0.0*asin(x)`） | 缩步差分恒为 0，仍判零：反求 `[0, +∞)` |
+| 名义点在域外（x0 = 1.000000001） | f(x0) 非有限，反求/GUM 仍 **422**，且不保存计算记录 |
+| 名义点恰好钉在边界（asin 的 x = ±1） | 任何浮点可分辨扰动都越界，GUM 一阶无定义，仍 **422** |
+
 ## 模型表达式白名单
 
 表达式在服务端经 Python AST 解析后**逐节点白名单校验**，不经过任何 `eval`：
@@ -1004,7 +1136,7 @@ pip install -r requirements.txt pytest httpx
 python -m pytest -q
 ```
 
-测试覆盖：表达式注入拒绝、单位换算与量纲校验、PSD 拒绝（< -1e-8）/舍入修复（[-1e-8,0)，保单位对角）/奇异接受（r=±1 零特征值）、r=±1 的 GUM 解析解 |ua+r·ub| 与 MC 同/反向传播、完全抵消退化为确定值、**小量级（u=1e-9）真实 ~1e-18 方差不被固定绝对阈值钳零（r=+1→2e-9、r=−1 不等→1e-9、r=−1 相等→0）及其 HTTP 登记/计算/幂等/查询/非法矩阵拒绝不落库**、MC 与线性高斯解析解对比、固定种子可复现、幂等与冲突、不收敛/NaN 不落库、查询接口、**精度反求二次不等式（负相关 r=−1→ua∈[1,3] 双侧有界、相关输入零端点开、零灵敏度→上界 null 无上限、无法达标→空区间、目标零/单位换算/未知版本/未知输入/量纲不符/负值/NaN/Inf 拒绝、只读不改模型不写记录不影响幂等与传播）**、**小量级反求（毫米模型目标 1e-9→闭区间 [0,1e-9] mm 真实小正上界保留、1e-13 微小灵敏度不误判为零→[0,1e9] 有限上界、小量级负相关双端区间 [1e-9,3e-9]、小量级真零灵敏度仍无上限）**、**定义域边界反求（1+1e-10·sqrt(x) 在 x0=1e-8 处中心差分扩步被 x−h<0 截断→域内单侧探针确认真实斜率 5e-7→闭区间 [0,~0.19] 且当前值达标、同边界真零斜率 0.0*sqrt(x) 仍无上限、反求与 GUM 管线梯度一致、过紧目标→上界随目标收缩且不达标）**等（88 个用例）。
+测试覆盖：表达式注入拒绝、单位换算与量纲校验、PSD 拒绝（< -1e-8）/舍入修复（[-1e-8,0)，保单位对角）/奇异接受（r=±1 零特征值）、r=±1 的 GUM 解析解 |ua+r·ub| 与 MC 同/反向传播、完全抵消退化为确定值、**小量级（u=1e-9）真实 ~1e-18 方差不被固定绝对阈值钳零（r=+1→2e-9、r=−1 不等→1e-9、r=−1 相等→0）及其 HTTP 登记/计算/幂等/查询/非法矩阵拒绝不落库**、MC 与线性高斯解析解对比、固定种子可复现、幂等与冲突、不收敛/NaN 不落库、查询接口、**精度反求二次不等式（负相关 r=−1→ua∈[1,3] 双侧有界、相关输入零端点开、零灵敏度→上界 null 无上限、无法达标→空区间、目标零/单位换算/未知版本/未知输入/量纲不符/负值/NaN/Inf 拒绝、只读不改模型不写记录不影响幂等与传播）**、**小量级反求（毫米模型目标 1e-9→闭区间 [0,1e-9] mm 真实小正上界保留、1e-13 微小灵敏度不误判为零→[0,1e9] 有限上界、小量级负相关双端区间 [1e-9,3e-9]、小量级真零灵敏度仍无上限）**、**定义域边界反求（1+1e-10·sqrt(x) 在 x0=1e-8 处中心差分扩步被 x−h<0 截断→域内单侧探针确认真实斜率 5e-7→闭区间 [0,~0.19] 且当前值达标、同边界真零斜率 0.0*sqrt(x) 仍无上限、反求与 GUM 管线梯度一致、过紧目标→上界随目标收缩且不达标）、首个探针即越界反求（1+asin(x) 在 x0=1−5e-9 处初始对称步长 h0≈6e-6 使 x+h0>1→域内缩步取双侧中心差分 g≈1e4→闭区间 [0,~1e-9] 且当前值达标、同模型 GUM/MC 传播 201、acos 同右边界、sqrt/log 小正名义点 h0>x0、大步单侧一阶差分 558 的 94% 曲率误差不被采用、同边界真零斜率 0.0*asin(x) 仍无上限、内部点路径不变、名义点在域外与恰钉边界 x=±1 仍 422 不落库）**等（100 个用例）。
 
 ## 项目结构
 

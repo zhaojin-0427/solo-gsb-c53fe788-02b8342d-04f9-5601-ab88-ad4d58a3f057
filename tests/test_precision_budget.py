@@ -625,6 +625,117 @@ def test_domain_boundary_tight_target_not_satisfied(client):
 
 
 # ---------------------------------------------------------------------------
+# 首个对称探针越过定义域（asin 右边界）：名义点有效时不得 422
+# ---------------------------------------------------------------------------
+
+def _asin_edge_model(version: str, *, flat: bool = False, value: float = 1.0 - 5e-9):
+    return {
+        "version": version,
+        "expression": "1.0 + 0.0*asin(x)" if flat else "1 + asin(x)",
+        "inputs": [
+            {"name": "x", "value": value, "unit": "dimensionless",
+             "standard_uncertainty": 1e-10, "distribution": "normal"},
+        ],
+        "output_unit": "dimensionless",
+        "correlations": [],
+    }
+
+
+def test_asin_right_edge_reverse_solve_closed_interval(client):
+    # y = 1 + asin(x)，x0 = 1-5e-9、ux = 1e-10。初始对称步长 h0 ≈ 6.06e-6
+    # 远大于到右边界的距离 5e-9，旧实现首个探针 x0+h0>1 即 NaN -> 422。
+    # 修复后域内缩步取双侧中心差分：g = 1/sqrt(1-x0²) ≈ 1e4（有限正
+    # 灵敏度），目标 1e-5 => ux ∈ [0, ~1e-9] 闭区间，当前值达标。
+    _register(client, _asin_edge_model("pb-asin-edge"))
+    r = _budget(client, "pb-asin-edge", "x", 1e-5)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    sens = body["sensitivity"]["coefficient"]
+    # 精确斜率 1/sqrt(1-x0²) ≈ 10000；缩步中心差分相对误差 < 1e-5
+    assert 9999.0 < sens < 10001.0
+    iv = body["interval"]
+    assert iv["feasible"] is True and iv["unbounded_upper"] is False
+    assert iv["lower"] == 0.0 and iv["lower_inclusive"] is True
+    assert iv["upper"] is not None and abs(iv["upper"] - 1e-9) / 1e-9 < 1e-4
+    assert iv["upper_inclusive"] is True
+    # 当前 ux = 1e-10 => uc ≈ 1e-6 ≤ 1e-5，达标
+    assert body["satisfied"] is True
+    assert body["current_combined_standard_uncertainty"]["value"] < 1e-5
+
+
+def test_asin_right_edge_gum_evaluation_succeeds(client):
+    # 同一模型的 GUM 传播共用同一梯度路径：反求曾 422 的模型，
+    # /api/v1/evaluations 必须 201，GUM uc 有限为正且与反求一致。
+    payload = {
+        "model_version": "pb-asin-edge",
+        "inputs": _asin_edge_model("pb-asin-edge")["inputs"],
+        "correlations": [],
+        "n": 5000, "seed": 20261006, "idempotency_key": "pb-asin-edge-eval-0001",
+    }
+    r = client.post("/api/v1/evaluations", json=payload)
+    assert r.status_code == 201, r.text
+    result = r.json()["result"]
+    gum_uc = result["combined"]["gum"]["standard_uncertainty"]
+    assert gum_uc > 0.0 and math.isfinite(gum_uc)
+    # GUM 线性化：uc = g·ux ≈ 1e4·1e-10 = 1e-6
+    assert abs(gum_uc - 1e-6) / 1e-6 < 1e-4
+    sens = result["sensitivities"]["x"]["coefficient"]
+    assert 9999.0 < sens < 10001.0
+    # MC 50σ 余量不越界，正常收敛
+    assert result["convergence"]["converged"] is True
+    # 反求与 GUM 的梯度/当前合成标准不确定度一致
+    body = _budget(client, "pb-asin-edge", "x", 1e-5).json()
+    assert body["sensitivity"]["coefficient"] == sens
+    assert body["current_combined_standard_uncertainty"]["value"] == gum_uc
+
+
+def test_asin_right_edge_true_zero_slope_still_unbounded(client):
+    # 同一边界结构下的真零斜率（1 + 0.0*asin(x)）：域内缩步差分恒为 0，
+    # 仍判零 -> [0, +∞)，当前值达标。
+    _register(client, _asin_edge_model("pb-asin-flat", flat=True))
+    body = _budget(client, "pb-asin-flat", "x", 1e-5).json()
+    assert body["sensitivity"]["coefficient"] == 0.0
+    iv = body["interval"]
+    assert iv["feasible"] is True and iv["unbounded_upper"] is True
+    assert iv["upper"] is None and iv["lower"] == 0.0
+    assert body["satisfied"] is True
+
+
+def test_asin_interior_point_reverse_solve_and_gum(client):
+    # 两侧都远离边界的内部点（x0 = 0.999）：反求与 GUM 正常，斜率
+    # 1/sqrt(1-x0²) ≈ 22.366，上界 1e-5/22.366 ≈ 4.47e-7。
+    _register(client, _asin_edge_model("pb-asin-interior", value=0.999))
+    body = _budget(client, "pb-asin-interior", "x", 1e-5).json()
+    sens = body["sensitivity"]["coefficient"]
+    assert abs(sens - 1.0 / math.sqrt(1.0 - 0.999 ** 2)) / sens < 1e-5
+    iv = body["interval"]
+    assert iv["feasible"] is True
+    assert abs(iv["upper"] - 1e-5 / sens) < 1e-12
+    # g·ux ≈ 22.366·1e-10 ≈ 2.24e-9 ≤ 1e-5 => 当前值达标
+    assert body["satisfied"] is True
+
+
+def test_asin_invalid_nominal_still_rejected(client):
+    # 名义点本身在域外（x0 = 1+1e-9）：反求与 GUM 仍按原语义 422 拒绝，
+    # 模型可登记但任何传播都不落库。
+    _register(client, _asin_edge_model("pb-asin-invalid", value=1.0 + 1e-9))
+    r = _budget(client, "pb-asin-invalid", "x", 1e-5)
+    assert r.status_code == 422
+    assert r.json()["error"] == "PropagationError"
+    r = client.post("/api/v1/evaluations", json={
+        "model_version": "pb-asin-invalid",
+        "inputs": _asin_edge_model("pb-asin-invalid", value=1.0 + 1e-9)["inputs"],
+        "correlations": [],
+        "n": 5000, "seed": 1, "idempotency_key": "pb-asin-invalid-eval",
+    })
+    assert r.status_code == 422
+    assert r.json()["error"] == "PropagationError"
+    # 422 不落库
+    listed = client.get("/api/v1/evaluations?model_version=pb-asin-invalid").json()
+    assert listed["count"] == 0
+
+
+# ---------------------------------------------------------------------------
 # 只读语义：不改模型、不写计算记录；既有功能不受影响
 # ---------------------------------------------------------------------------
 

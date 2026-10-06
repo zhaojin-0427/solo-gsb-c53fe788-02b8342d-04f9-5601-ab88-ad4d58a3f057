@@ -390,3 +390,114 @@ def test_gradient_domain_boundary_true_zero_stays_zero():
     grad, noise, resolved = numerical_gradient_with_noise(expr, {"x": 1e-8}, ("x",))
     assert grad[0] == 0.0
     assert bool(resolved[0]) is False
+
+
+# ---------------------------------------------------------------------------
+# 首个对称探针越过定义域：名义点有效时域内缩步（asin 右边界镜像 sqrt 左边界）
+# ---------------------------------------------------------------------------
+
+def test_gradient_first_probe_beyond_asin_domain_shrinks_inside():
+    # y = 1 + asin(x)，x0 = 1-5e-9：初始对称步长 h0 = eps^(1/3) ≈ 6.06e-6
+    # 远大于到右边界的距离 5e-9，x0+h0 > 1 使首个探针 NaN。旧实现直接抛
+    # PropagationError（错误拒绝有效名义点）；修复后域内缩步取双侧中心
+    # 差分，斜率 ≈ 1/sqrt(1-x0²) ≈ 10000（有限、为正、可辨），相对误差
+    # 在 1e-5 以内——绝不使用大步单侧一阶差分（其曲率误差 ~94%，斜率
+    # 被低估到 ~558）。
+    from app.expressions import compile_expression
+    from app.engine import numerical_gradient_with_noise
+
+    x0 = 1.0 - 5e-9
+    expr = compile_expression("1 + asin(x)", ("x",))
+    grad, noise, resolved = numerical_gradient_with_noise(expr, {"x": x0}, ("x",))
+    exact = 1.0 / math.sqrt(1.0 - x0 * x0)
+    assert np.isfinite(grad[0])
+    assert grad[0] > 0.0
+    assert bool(resolved[0]) is True
+    assert abs(grad[0] - exact) / exact < 1e-5
+    # 大步单侧一阶差分（错误做法）在该点只有 ~558：修复值必须远高于它
+    one_sided_big = (math.asin(x0) - math.asin(x0 - np.finfo(float).eps ** (1.0 / 3.0))) \
+        / np.finfo(float).eps ** (1.0 / 3.0)
+    assert grad[0] > 10.0 * one_sided_big
+
+
+def test_gradient_first_probe_beyond_acos_domain_shrinks_inside():
+    # acos 在同一右边界镜像场景：x0+h0 > 1。缩步必须在截断/舍入平衡点
+    # 停止——若一路缩到 ulp 尺度，相邻浮点表示的舍入会给出偏差 5%~26%
+    # 的伪梯度。精确斜率 -1/sqrt(1-x0²) ≈ -10000。
+    from app.expressions import compile_expression
+    from app.engine import numerical_gradient_with_noise
+
+    x0 = 1.0 - 5e-9
+    expr = compile_expression("acos(x)", ("x",))
+    grad, noise, resolved = numerical_gradient_with_noise(expr, {"x": x0}, ("x",))
+    exact = -1.0 / math.sqrt(1.0 - x0 * x0)
+    assert bool(resolved[0]) is True
+    assert abs(grad[0] - exact) / abs(exact) < 1e-5
+
+
+def test_gradient_first_probe_beyond_sqrt_domain_tiny_nominal_shrinks():
+    # 左边界镜像：sqrt(x) 在 x0 = 1e-12 处 h0 > x0，首个探针 x0-h0 < 0。
+    # 域内缩步恢复精确斜率 1/(2 sqrt(x0)) = 5e5。
+    from app.expressions import compile_expression
+    from app.engine import numerical_gradient_with_noise
+
+    expr = compile_expression("sqrt(x)", ("x",))
+    grad, noise, resolved = numerical_gradient_with_noise(expr, {"x": 1e-12}, ("x",))
+    exact = 0.5 / math.sqrt(1e-12)
+    assert bool(resolved[0]) is True
+    assert abs(grad[0] - exact) / exact < 1e-8
+
+
+def test_gradient_first_probe_beyond_domain_true_zero_stays_zero():
+    # 首个探针越界缩步场景下的真零斜率（1 + 0.0*asin(x)）：域内中心差分
+    # 差值恒为 0、单侧探针也无变化，仍判零（梯度 0、不可辨）。
+    from app.expressions import compile_expression
+    from app.engine import numerical_gradient_with_noise
+
+    x0 = 1.0 - 5e-9
+    expr = compile_expression("1.0 + 0.0*asin(x)", ("x",))
+    grad, noise, resolved = numerical_gradient_with_noise(expr, {"x": x0}, ("x",))
+    assert grad[0] == 0.0
+    assert bool(resolved[0]) is False
+
+
+def test_gradient_nominal_pinned_at_domain_boundary_still_rejected():
+    # 名义点恰钉在边界（asin 的 x=±1）：向内一侧最多一个 ulp、向外一侧
+    # 必越界，任何浮点可分辨的双侧探针都不存在——GUM 一阶传播无定义，
+    # 保持“名义点无效即拒绝”的原语义（PropagationError）。
+    import pytest
+    from app.expressions import compile_expression
+    from app.engine import numerical_gradient_with_noise
+    from app.errors import PropagationError
+
+    expr = compile_expression("1 + asin(x)", ("x",))
+    for pinned in (1.0, -1.0):
+        with pytest.raises(PropagationError):
+            numerical_gradient_with_noise(expr, {"x": pinned}, ("x",))
+
+
+def test_gradient_nominal_outside_domain_still_rejected():
+    # 名义点本身就在域外（asin 的 x = 1+1e-9）：f(x0) 非有限，直接拒绝，
+    # 不进入缩步/探针流程。
+    import pytest
+    from app.expressions import compile_expression
+    from app.engine import numerical_gradient_with_noise
+    from app.errors import PropagationError
+
+    expr = compile_expression("1 + asin(x)", ("x",))
+    with pytest.raises(PropagationError):
+        numerical_gradient_with_noise(expr, {"x": 1.0 + 1e-9}, ("x",))
+
+
+def test_gradient_two_sided_interior_points_unchanged():
+    # 两侧都远离边界的内部点：梯度路径与精度不随缩步分支改变。
+    from app.expressions import compile_expression
+    from app.engine import numerical_gradient_with_noise
+
+    expr = compile_expression("1 + asin(x)", ("x",))
+    for x0 in (0.0, 0.5, 0.999, -0.999):
+        grad, noise, resolved = numerical_gradient_with_noise(expr, {"x": x0}, ("x",))
+        exact = 1.0 / math.sqrt(1.0 - x0 * x0)
+        assert bool(resolved[0]) is True
+        # 内部点沿用初始 h0 中心差分（截断/舍入平衡尺度），1e-5 级相对精度
+        assert abs(grad[0] - exact) / exact < 1e-5
