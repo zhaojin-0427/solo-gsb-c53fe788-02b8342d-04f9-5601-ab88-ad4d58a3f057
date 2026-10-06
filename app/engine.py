@@ -289,6 +289,16 @@ GRADIENT_RESOLUTION_FACTOR = 100.0
 #: 中心差分平衡截断误差 O(h²) 与舍入误差 O(eps/h) 的经典最优步长尺度。
 _GRADIENT_STEP_GROWTH = 8.0
 
+#: 初始（或放大后的）对称步长越过模型定义域时，向“浮点可分辨”方向收缩
+#: 步长的几何因子。每次减半直到 x0±h 两侧都落在有效域内：步长一旦小于
+#: 名义点到边界的距离，对称中心差分即可用，斜率无需动用单侧差分。
+_GRADIENT_STEP_SHRINK = 0.5
+
+#: 浮点可分辨步长下限 h_floor = eps·max(|x0|, 1)：x0±h 在该尺度上已坍缩为
+#: x0，再小的对称探针不可能提供任何斜率信息。收缩到该尺度仍有一侧越界，
+#: 说明名义点本身已紧贴定义域端点（如 sqrt(0)、asin(1)），转单侧估计。
+_GRADIENT_STEP_FLOOR_FACTOR = 1.0
+
 #: 可辨后继续放大步长时，相邻梯度允许的单步相对漂移。线性模型的舍入
 #: 噪声随 h 增大而减小（漂移恒小）；而截断误差 O(h²) 每放大 8 倍步长
 #: 增长 64 倍（漂移巨大）——该因子介于两者之间，用于在高曲率零名义点
@@ -334,6 +344,23 @@ def numerical_gradient_with_noise(
     方向（f+ == f- 恒成立，如 ``2*(a-a)``）逐级放大到上限仍不可辨，
     梯度保持 0.0，噪声按最终步长（只会更严格）计算。
 
+    **初始探针越过定义域：向浮点可分辨尺度收缩对称步长。** 初始对称
+    步长 h0 = eps^(2/3)·max(|x0|, eps^(2/3)) 可能本身就越过定义域边界
+    （如 y = 1 + asin(x) 在 x0 = 1−5e-9 处，h0 ≈ 6e-6 ≫ 5e-9，x0+h0
+    > 1 立即产生 NaN；旧实现直接抛 PropagationError，使本来有效的名义
+    点被误拒绝）。此时不改用大步单侧差分（一阶单侧截断误差 O(h) 在边界
+    高曲率点会严重偏斜斜率——asin 在 x→1⁻ 处大步单侧误差可达数倍），
+    而是把 h 按 :data:`_GRADIENT_STEP_SHRINK` 逐次减半，直到 x0±h 都
+    留在有效域（h 小于名义点到边界的距离即成立），继续使用对称中心
+    差分（截断误差仍为 O(h²)，且为域内两侧取点）。收缩到浮点可分辨
+    下限 h_floor = eps·max(|x0|, 1)（再小 x0±h 已坍缩为 x0）仍有一侧
+    越界，才判定名义点紧贴端点（如 sqrt(0)、asin(1)），转
+    :func:`_onesided_gradient_at_boundary` 用小步二阶单侧差分给斜率。
+    收缩得到的对称步长若仍处于高曲率截断区，再减半一次：只要减半后
+    仍可辨就采用更小的步长（截断随 h 单调减小），否则保留减半前步长。
+    名义点本身 f(x0) 就非有限（NaN/Inf）依旧立即抛错——
+    定义域外的名义点按原语义拒绝。
+
     **定义域边界截断时的单侧确认。** 中心差分扩步可能被定义域提前截断
     （如 ``1.0 + 1e-10*sqrt(x)`` 在 x0 = 1e-8 处：h 稍大于 x0 即 x-h < 0，
     步长到不了 h_cap），此时差分值 |f+−f-| = |g|·2h 被步长上限钳在偏置
@@ -355,6 +382,8 @@ def numerical_gradient_with_noise(
         x0 = x_base[name]
         h = _EPS13 * max(abs(x0), _EPS13)
         h_cap = _EPS13 * max(abs(x0), 1.0)
+        # 浮点可分辨步长下限：低于它时 x0±h 已舍入回 x0，探针无信息
+        h_floor = _GRADIENT_STEP_FLOOR_FACTOR * _EPS * max(abs(x0), 1.0)
 
         def probe(step: float) -> tuple[float, float, float, bool]:
             env_plus = dict(x_base)
@@ -371,13 +400,60 @@ def numerical_gradient_with_noise(
             resolved = abs(yp - ym) > GRADIENT_RESOLUTION_FACTOR * _EPS * max(abs(yp), abs(ym))
             return yp, ym, g, resolved
 
-        # 初始 h0 非有限（NaN/Inf，定义域被越过）：直接抛错（历史行为）
-        yp, ym, g, resolved = probe(h)
+        # 名义点本身必须有效：定义域外的名义点按原语义直接拒绝
+        # （NaN 经由 numpy 产生时伴随 RuntimeWarning，与探针/MC 路径一致压掉）。
+        with np.errstate(all="ignore"):
+            _evaluate_scalar(compiled, x_base)
+
+        # 初始对称探针：越过定义域（x0±h 出域 -> NaN/Inf）时，不采用大步
+        # 单侧差分（O(h) 截断误差在边界高曲率处会严重偏斜斜率），而是把
+        # 对称步长逐次减半到两侧都留在有效域——h 一旦小于名义点到边界的
+        # 距离，中心差分即恢复可用（O(h²) 截断）。
+        shrank = False
+        try:
+            yp, ym, g, resolved = probe(h)
+        except PropagationError:
+            shrank = True
+            yp = ym = g = 0.0
+            resolved = False
+            found = False
+            while h > h_floor:
+                h = max(h * _GRADIENT_STEP_SHRINK, h_floor)
+                try:
+                    yp, ym, g, resolved = probe(h)
+                except PropagationError:
+                    continue  # 仍有一侧出域：继续向浮点可分辨尺度收缩
+                found = True
+                break
+            if not found:  # 收缩到 h_floor 仍出域 => 名义点紧贴端点
+                g, h, yp, ym, resolved = _onesided_gradient_at_boundary(
+                    compiled, x_base, name, x0, h_cap
+                )
+                grad[k] = g
+                noise[k] = _EPS * max(abs(yp), abs(ym)) / (2.0 * h)
+                resolved_mask[k] = resolved
+                continue
+
+        # 阶段 0（仅对称步长收缩过）：步长被边界压到 h ≪ h_cap 时可能处于
+        # 高曲率截断区（asin 在 x→1⁻ 处 f'' ~ 1/d，相对截断 ~h/d）。再做
+        # 一次减半：与扩步阶段不同，收缩时更小的步长截断误差恒更小（单调
+        # 改善），故只要减半后仍可辨（不被输出舍入淹没）且两侧在域内，就
+        # 采用更小的步长；减半后不可辨（舍入接管）或出域则保留当前步长。
+        if shrank and h > h_floor:
+            hs = max(h * _GRADIENT_STEP_SHRINK, h_floor)
+            try:
+                yps, yms, gs, rs = probe(hs)
+            except PropagationError:
+                pass  # 减半后反而出域（不应发生）：保留当前步长
+            else:
+                if rs:
+                    h, yp, ym, g, resolved = hs, yps, yms, gs, rs
 
         # 阶段 1：差分值被输出舍入淹没 => 放大步长直到可辨或到达 h_cap
+        # （收缩得到的步长受边界限制，不能再放大：放大即出域，直接跳过）
         grew = False
         blocked = False
-        if not resolved:
+        if not shrank and not resolved:
             while not resolved and h < h_cap:
                 hn = min(h * _GRADIENT_STEP_GROWTH, h_cap)
                 try:
@@ -404,14 +480,70 @@ def numerical_gradient_with_noise(
                 h, yp, ym, g, resolved = hn, ypn, ymn, gn, rn
 
         # 定义域边界截断且差分不可辨：用域内单侧探针确认输出是否真的
-        # 依赖该输入（确认的是“非零”，斜率值仍用上面的中心差分估计）。
-        if not resolved and blocked:
+        # 依赖该输入（确认的是“非零”，斜率值仍用上面的中心差分估计；
+        # 收缩得到的步长同样受边界限制、到不了 h_cap，一并在此确认）。
+        if not resolved and (blocked or shrank):
             resolved = _onesided_dependence_resolved(compiled, x_base, name, x0, h, h_cap)
 
         grad[k] = g
         noise[k] = _EPS * max(abs(yp), abs(ym)) / (2.0 * h)
         resolved_mask[k] = resolved
     return grad, noise, resolved_mask
+
+
+def _onesided_gradient_at_boundary(
+    compiled: CompiledExpression,
+    x_base: Mapping[str, float],
+    name: str,
+    x0: float,
+    h_cap: float,
+) -> tuple[float, float, float, float, bool]:
+    """名义点紧贴定义域端点时的小步**二阶**单侧斜率估计。
+
+    对称探针收缩到浮点可分辨下限 h_floor 仍有一侧出域（如 sqrt(0) 的
+    x−h<0、asin(1) 的 x+h>1），说明名义点本身就是端点：中心差分在浮点上
+    无法取点。此时只在域内一侧取 *两个* 点作二阶单侧差分
+
+        f′(x0) ≈ s·(−3f0 + 4f1 − f2)/(2h)，
+        f1 = f(x0+s·h)，f2 = f(x0+s·2h)，s ∈ {+1, −1}
+
+    （s=+1 对左端点如 sqrt/log 在 0；s=−1 对右端点如 asin/acos 在 ±1）。
+    二阶形式消去了一阶单侧差分的 O(h) 截断主项（余 O(h²)），这正是只做
+    “是否依赖”裁决的 :func:`_onesided_dependence_resolved` 不承担的角色——
+    那里明确禁止用大步一阶差分当斜率（sqrt 近 0 处 f''·h 可超过 |g|）。
+    h 从 h_cap 起逐次减半直到 x0+s·h、x0+s·2h 都在域内（端点处 h 恒有
+    域内空间，除非函数在域内紧邻处也无定义——此时名义点视为无效，抛错）。
+
+    返回 ``(g, h, f1, f2, resolved)``；可辨门槛与中心差分一致（域内单侧
+    变化量超过输出舍入尺度的 F 倍）。真零方向（如 0.0*sqrt(x) 在 0）
+    f0 == f1 == f2，g 恰为 0、不可辨。
+    """
+    with np.errstate(all="ignore"):
+        f0 = _evaluate_scalar(compiled, x_base)
+    h_floor = _EPS * max(abs(x0), 1.0)
+    for sign in (1.0, -1.0):
+        step = h_cap
+        while step > h_floor:
+            env1 = dict(x_base)
+            env2 = dict(x_base)
+            env1[name] = x0 + sign * step
+            env2[name] = x0 + sign * 2.0 * step
+            try:
+                with np.errstate(all="ignore"):
+                    f1 = _evaluate_scalar(compiled, env1)
+                    f2 = _evaluate_scalar(compiled, env2)
+            except PropagationError:
+                step *= _GRADIENT_STEP_SHRINK
+                continue
+            g = sign * (-3.0 * f0 + 4.0 * f1 - f2) / (2.0 * step)
+            resolved = (
+                abs(f1 - f0) > GRADIENT_RESOLUTION_FACTOR * _EPS * max(abs(f0), abs(f1))
+                or abs(f2 - f1) > GRADIENT_RESOLUTION_FACTOR * _EPS * max(abs(f1), abs(f2))
+            )
+            return g, step, f1, f2, resolved
+    raise PropagationError(
+        "模型在名义点（或其邻域）产生了非有限结果（NaN/Inf），无法传播不确定度"
+    )
 
 
 def _onesided_dependence_resolved(
@@ -480,7 +612,10 @@ def run_gum(
     ctx,
 ) -> GumResult:
     """GUM 一阶线性化（输出空间）。"""
-    y_base = _evaluate_scalar(compiled, x_base)
+    # 名义点出域（如 asin(1.0001)）会给 NaN：numpy 伴随的 RuntimeWarning
+    # 与梯度探针、MC 路径一致压掉，由 _evaluate_scalar 转成明确的拒绝。
+    with np.errstate(all="ignore"):
+        y_base = _evaluate_scalar(compiled, x_base)
     grad_base = numerical_gradient(compiled, x_base, names)
     cov = (std_base[:, None] * corr * std_base[None, :])
     var_y = float(grad_base @ cov @ grad_base)

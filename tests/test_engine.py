@@ -380,6 +380,66 @@ def test_gradient_widening_stops_at_domain_boundary():
     assert bool(resolved[0]) is True  # 单侧探针确认依赖：不得误判为零
 
 
+def test_gradient_initial_probe_beyond_domain_shrinks_symmetric_step():
+    # 回归：y = 1 + asin(x)，x0 = 1−5e-9 是有效名义点，但初始对称步长
+    # h0 = eps^(2/3) ≈ 6e-6 ≫ 5e-9，x0+h0 > 1 立即越界。旧实现直接抛
+    # PropagationError（有效的名义点被误拒绝，反求 422、GUM 不可算）。
+    # 修复：对称步长向浮点可分辨尺度逐次减半，直到 x0±h 都在域内，继续用
+    # 对称中心差分（绝不用大步单侧差分——其 O(h) 截断在 x→1⁻ 处误差达数倍）。
+    from app.expressions import compile_expression
+    from app.engine import numerical_gradient_with_noise
+    from app.errors import PropagationError
+
+    expr = compile_expression("1 + asin(x)", ("x",))
+    x0 = 1 - 5e-9
+    g, noise, resolved = numerical_gradient_with_noise(expr, {"x": x0}, ("x",))
+    g_true = 1.0 / math.sqrt(1.0 - x0 * x0)
+    assert math.isfinite(g[0]) and g[0] > 0.0
+    assert abs(g[0] - g_true) / g_true < 0.05  # 域内对称收缩：误差远低于大步单侧
+    assert bool(resolved[0]) is True
+
+    # 左边界（-1+5e-9）：x0-h < -1 越界，同样向域内收缩
+    xl = -1.0 + 5e-9
+    gl, _, rl = numerical_gradient_with_noise(expr, {"x": xl}, ("x",))
+    gl_true = 1.0 / math.sqrt(1.0 - xl * xl)
+    assert gl[0] > 0.0 and abs(gl[0] - gl_true) / gl_true < 0.05 and bool(rl[0])
+
+    # 内部点不变：x0=0.5 走原始初始步长路径
+    gi, _, ri = numerical_gradient_with_noise(expr, {"x": 0.5}, ("x",))
+    assert abs(gi[0] - 1.0 / math.sqrt(0.75)) < 1e-9 and bool(ri[0])
+
+    # 名义点本身在域外：仍按原语义抛错（收缩只救有效名义点）
+    try:
+        numerical_gradient_with_noise(expr, {"x": 1.0001}, ("x",))
+        assert False, "域外名义点必须拒绝"
+    except PropagationError:
+        pass
+
+
+def test_gradient_exact_endpoint_uses_small_step_onesided_estimate():
+    # 名义点恰在定义域端点（中心差分在浮点上无法取点）：小步二阶单侧差分
+    # 给有限、正（或对 acos 为负）的斜率，不再直接抛错；真零方向仍判零。
+    from app.expressions import compile_expression
+    from app.engine import numerical_gradient_with_noise
+
+    for src, x0, positive in (
+        ("sqrt(x)", 0.0, True),
+        ("asin(x)", 1.0, True),
+        ("asin(x)", -1.0, True),
+        ("acos(x)", 1.0, False),
+    ):
+        expr = compile_expression(src, ("x",))
+        g, _, resolved = numerical_gradient_with_noise(expr, {"x": x0}, ("x",))
+        assert math.isfinite(g[0]), (src, x0)
+        assert (float(g[0]) > 0.0) == positive, (src, x0, g[0])
+        assert bool(resolved[0]) is True
+
+    # 端点处的真零斜率（0.0*sqrt(x) 在 x=0）：二阶单侧差分恒为 0、不可辨
+    expr = compile_expression("1.0 + 0.0*sqrt(x)", ("x",))
+    g, _, resolved = numerical_gradient_with_noise(expr, {"x": 0.0}, ("x",))
+    assert g[0] == 0.0 and bool(resolved[0]) is False
+
+
 def test_gradient_domain_boundary_true_zero_stays_zero():
     # 同一边界结构下的真零方向（0.0*sqrt(x)）：单侧探针到 h_cap 差值恒为 0，
     # 维持零结论（梯度严格 0、不可辨）。

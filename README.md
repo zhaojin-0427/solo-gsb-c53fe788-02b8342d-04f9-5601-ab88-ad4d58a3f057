@@ -60,7 +60,7 @@ docker compose up --build -d
 
 SQLite 数据库保存在命名卷 `uncertainty-data`（容器内 `/data/uncertainty.db`），容器重建后数据仍在。
 
-全部接口随该命令一同启动（含只读的测量精度反求接口 `POST /api/v1/precision-budgets`，无需额外配置）；反求接口的调用示例见 [第 9 节](#9-测量精度反求precision-budgets)。
+全部接口随该命令一同启动（含只读的测量精度反求接口 `POST /api/v1/precision-budgets`，无需额外配置）；反求接口的调用示例见 [第 9 节](#9-测量精度反求precision-budgets)。名义点紧贴定义域边界的模型（如 `y = 1 + asin(x)` 在 x = 1−5e-9 处，首个梯度探针即越过 x ≤ 1）也可直接反求与传播，见 [9.8 节](#98-右定义域边界asin-在-x1首个对称探针越界时收缩步长闭区间-1e-9)。
 
 停止：
 
@@ -948,6 +948,132 @@ curl -sS -X POST http://localhost:8000/api/v1/precision-budgets \
 ```
 
 > 同一边界结构下的**真零斜率**（如 `y = 1.0 + 0.0*sqrt(x)`）单侧探针到 `h_cap` 差值恒为 0，仍判零：同样的请求返回 `[0, +∞)`（`upper=null`、`unbounded_upper=true`）——边界截断不改变真零方向的裁决。反求与 GUM 传播共用同一梯度路径：该模型的 `POST /api/v1/evaluations` 给出的 GUM 合成标准不确定度与上面响应中的 `current_combined_standard_uncertainty` 完全一致（5.20390617002552e-16）。
+
+#### 9.8 右定义域边界（asin 在 x→1⁻）：首个对称探针越界时收缩步长（闭区间 ~1e-9）
+
+9.7 的模型名义点离边界还有“初始步长容得下”的距离，扩步才被截断；本节的模型更极端——**第一个对称探针本身就越过定义域**。无量纲模型 `y = 1 + asin(x)`，名义点 x = 1−5e-9 = 0.999999995（在 `asin` 定义域 [−1, 1] 内，有效），ux = 1e-10，目标 u(y) ≤ 1e-5。
+
+数值梯度的初始对称步长是 `h0 = eps^(2/3)·max(|x0|, eps^(2/3)) ≈ 6.06e-6`，而名义点到右边界只有 5e-9：**x0 + h0 ≈ 1.000006 > 1**，`asin` 立即产生 NaN。旧实现把首个探针的非有限结果当作“模型在名义点邻域无定义”直接抛出，反求返回 `422 PropagationError`，同一梯度路径上的 GUM 也无法计算——尽管名义点本身完全有效。
+
+修复策略（两侧有效但步长越界时优先保住**对称**取样）：
+
+1. 名义点 `f(x0)` 本身先求值；非有限（如 x0 = 1.0001）仍按原语义 422 拒绝，绝不放行。
+2. 首个对称探针越界时，**不**改用大步单侧差分——单侧一阶差分的 O(h) 截断在 `x→1⁻` 的高曲率处误差可达数倍（本例大步单侧误差接近 −200%）；而是把对称步长按 1/2 逐次收缩，直到 `x0±h` 都落在有效域内（h 一旦小于名义点到边界的距离即成立），继续使用域内**对称中心差分**（O(h²) 截断）。
+3. 收缩后的步长（≈2.96e-9）上再减半复核一次：减半后仍可辨则采用更小步长（截断随 h 单调减小），否则保留减半前估计。最终斜率 ≈ 1.0114e4，解析值 `1/sqrt(1−x0²) ≈ 1.0000e4`，相对误差 ~1.1%。
+4. 若收缩到浮点可分辨下限 `h_floor = eps·max(|x0|,1)` 仍有一侧出域（名义点恰在端点，如 `asin(1)`、`sqrt(0)`），才改用域内一侧取两个点的**小步二阶单侧差分**（消去 O(h) 主项）给斜率；真零方向（如 `0.0*sqrt(x)` 在 0）差值恒为 0，仍判零。
+
+于是二次型 `v(u) = (g·u)² ≤ 1e-10` 正常求解：**ux ∈ [0, 9.88759e-10]**（闭区间，解析上界 t/g ≈ 1e-9），当前 ux = 1e-10 时 uc ≈ 1.01e-6 ≤ 1e-5，`satisfied=true`。
+
+一键启动（与其他接口相同，无需额外配置）：
+
+```bash
+docker compose up --build -d        # 服务在 http://localhost:8000
+curl -fsS http://localhost:8000/health
+```
+
+登记边界模型并提交反求：
+
+```bash
+curl -sS -X POST http://localhost:8000/api/v1/models \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "version": "asin-boundary-v1",
+    "name": "asin 右边界模型 y=1+asin(x)",
+    "expression": "1 + asin(x)",
+    "inputs": [
+      {"name": "x", "value": 0.999999995, "unit": "dimensionless",
+       "standard_uncertainty": 1e-10, "distribution": "normal"}
+    ],
+    "output_unit": "dimensionless"
+  }'
+# HTTP 201（名义点 0.999999995 在 asin 定义域 [-1, 1] 内；登记记录里 value 回显为 0.999999995）
+
+curl -sS -X POST http://localhost:8000/api/v1/precision-budgets \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model_version": "asin-boundary-v1",
+    "input_name": "x",
+    "target": {"standard_uncertainty": 1e-5, "unit": "dimensionless"}
+  }'
+```
+
+返回 `200`（以下为**实际响应**；JSON 数字按双精度浮点解析，登记时写 `0.999999995` 与 `1 - 5e-9` 所表示的双精度值一致）：
+
+```json
+{
+  "model_version": "asin-boundary-v1",
+  "input_name": "x",
+  "input_unit": "dimensionless",
+  "target": {"standard_uncertainty": 1e-05, "unit": "dimensionless"},
+  "target_in_output_unit": {"standard_uncertainty": 1e-05, "unit": "dimensionless"},
+  "sensitivity": {"coefficient": 10113.689455667234, "unit": "dimensionless/dimensionless"},
+  "current_standard_uncertainty": {"value": 1e-10, "unit": "dimensionless"},
+  "current_combined_standard_uncertainty": {"value": 1.011368946e-06, "unit": "dimensionless"},
+  "satisfied": true,
+  "interval": {
+    "feasible": true,
+    "lower": 0.0,
+    "lower_inclusive": true,
+    "upper": 9.88759e-10,
+    "upper_inclusive": true,
+    "unbounded_upper": false
+  }
+}
+```
+
+同一模型的 GUM 传播（`POST /api/v1/evaluations`，n=5000、seed=20261006）也可正常计算；GUM 与蒙特卡洛给出一致的有限覆盖区间，且 GUM 合成标准不确定度与反求响应的 `current_combined_standard_uncertainty` 逐值相同（1.011368946e-06）。返回 `201`（节选；`combined` 在响应的 `result` 字段下）：
+
+```bash
+curl -sS -X POST http://localhost:8000/api/v1/evaluations \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model_version": "asin-boundary-v1",
+    "inputs": [
+      {"name": "x", "value": 0.999999995, "unit": "dimensionless",
+       "standard_uncertainty": 1e-10, "distribution": "normal"}
+    ],
+    "correlations": [],
+    "n": 5000,
+    "seed": 20261006,
+    "idempotency_key": "asin-boundary-eval-0001"
+  }'
+```
+
+```json
+{
+  "id": "…",
+  "idempotency_key": "asin-boundary-eval-0001",
+  "result": {
+    "combined": {
+      "gum": {
+        "value": 2.570696326795159,
+        "standard_uncertainty": 1.011368946e-06,
+        "coverage_interval": {"low": 2.57069434454845, "high": 2.570698309041867},
+        "coverage_factor": 1.959963984540054,
+        "unit": "dimensionless"
+      },
+      "monte_carlo": {
+        "mean": 2.570696339205655,
+        "median": 2.570696349678363,
+        "standard_uncertainty": 1.002509917e-06,
+        "coverage_interval": {"low": 2.570694378340406, "high": 2.570698243908622},
+        "samples_range": {"min": 2.570692902952105, "max": 2.570699890545745},
+        "unit": "dimensionless"
+      }
+    },
+    "sensitivities": {
+      "x": {"coefficient": 10113.689455667234, "unit": "dimensionless/"}
+    }
+  }
+}
+```
+
+边界与拒绝语义保持不变：
+
+* 名义点在定义域外（如 x0 = 1.0001 提交 `asin` 模型）：反求与计算都仍返回 `422 PropagationError`（“非有限结果（NaN/Inf）”）；
+* 输入分布抽样越过定义域（如 x0 = 0.99、ux = 0.05 的正态抽样出现 x > 1）：蒙特卡洛仍以 `422` 拒绝并报告非有限样本数；
+* 真零斜率（如 `1 + x*x` 在 x = 0、`1 + 0.0*asin(x)` 在 1−5e-9）仍判零、返回无上限区间；内部点（如 `asin` 在 x = 0.5）的梯度路径与响应逐值不变；
+* 反求始终只读：不写计算记录、不修改登记的标准不确定度、可任意重复。
 
 ## 模型表达式白名单
 

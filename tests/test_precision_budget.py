@@ -625,6 +625,110 @@ def test_domain_boundary_tight_target_not_satisfied(client):
 
 
 # ---------------------------------------------------------------------------
+# 右定义域边界（asin 在 x→1⁻）：首个对称探针越界时收缩到域内，不拒绝
+# ---------------------------------------------------------------------------
+
+def _asin_boundary_model(version: str):
+    # y = 1 + asin(x)（无量纲），x0 = 1−5e-9、ux = 1e-10：有效名义点，
+    # 但初始对称步长 eps^(2/3) ≈ 6e-6 ≫ 5e-9，x0+h0 > 1 立即越界。
+    return {
+        "version": version,
+        "expression": "1 + asin(x)",
+        "inputs": [
+            {"name": "x", "value": 1 - 5e-9, "unit": "dimensionless",
+             "standard_uncertainty": 1e-10, "distribution": "normal"},
+        ],
+        "output_unit": "dimensionless",
+        "correlations": [],
+    }
+
+
+def test_asin_boundary_reverse_solving_closed_interval(client):
+    # 旧实现：梯度引擎首个探针越界即抛 PropagationError，反求 422。
+    # 修复：对称步长收缩到域内后用中心差分估斜率（有限正灵敏度，
+    # 解析 1/sqrt(1-x0²) ≈ 1.0e4），v(u) = (g·u)^2 <= 1e-10
+    # => u ∈ [0, ~1e-9] 闭区间；当前 ux = 1e-10 达标。
+    _register(client, _asin_boundary_model("pb-asin-boundary"))
+    r = _budget(client, "pb-asin-boundary", "x", 1e-5)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    # 有限正灵敏度，与解析值 1/sqrt(1-x0²) ≈ 10000 的相对误差 < 5%
+    # （域内对称中心差分；大步单侧差分会有数倍曲率误差，不可采用）
+    s = body["sensitivity"]["coefficient"]
+    assert 9.5e3 < s < 1.06e4
+    assert body["sensitivity"]["unit"] == "dimensionless/dimensionless"
+    iv = body["interval"]
+    assert iv["feasible"] is True and iv["unbounded_upper"] is False
+    assert iv["lower"] == 0.0 and iv["lower_inclusive"] is True
+    assert abs(iv["upper"] - 1e-9) / 1e-9 < 0.06 and iv["upper_inclusive"] is True
+    # 当前 ux = 1e-10 => uc ≈ s·1e-10 ≈ 1.01e-6 ≤ 1e-5，达标
+    assert body["satisfied"] is True
+    assert body["current_combined_standard_uncertainty"]["value"] < 1e-5
+
+
+def test_asin_boundary_gum_evaluation_shares_gradient_path(client):
+    # 同一梯度路径也用于 GUM：边界名义点的计算请求必须 201，
+    # 且 GUM 合成标准不确定度与反求响应的当前合成标准不确定度逐值一致。
+    payload = {
+        "model_version": "pb-asin-boundary",
+        "inputs": _asin_boundary_model("pb-asin-boundary")["inputs"],
+        "correlations": [],
+        "n": 5000, "seed": 20261006, "idempotency_key": "pb-asin-eval-0001",
+    }
+    r = client.post("/api/v1/evaluations", json=payload)
+    assert r.status_code == 201, r.text
+    result = r.json()["result"]
+    gum = result["combined"]["gum"]
+    # 名义值 1 + asin(1−5e-9) ≈ 2.5706963
+    assert abs(gum["value"] - (1.0 + math.asin(1 - 5e-9))) < 1e-12
+    assert gum["standard_uncertainty"] > 1e-6
+    # GUM 与蒙特卡洛均给出有限覆盖区间
+    assert gum["coverage_interval"]["low"] < gum["value"] < gum["coverage_interval"]["high"]
+    body = _budget(client, "pb-asin-boundary", "x", 1e-5).json()
+    assert body["current_combined_standard_uncertainty"]["value"] == gum["standard_uncertainty"]
+    assert abs(body["sensitivity"]["coefficient"]
+               - result["sensitivities"]["x"]["coefficient"]) < 1e-6
+
+
+def test_asin_boundary_reverse_solving_is_read_only(client):
+    # 边界模型的反求同样只读：不写计算记录、不改登记标准不确定度、可重复。
+    before = client.get("/api/v1/evaluations").json()["count"]
+    b1 = _budget(client, "pb-asin-boundary", "x", 1e-5).json()
+    b2 = _budget(client, "pb-asin-boundary", "x", 1e-5).json()
+    assert b1 == b2
+    after = client.get("/api/v1/evaluations").json()["count"]
+    assert after == before
+    ins = client.get("/api/v1/models/pb-asin-boundary").json()["inputs"][0]
+    assert ins["standard_uncertainty"] == 1e-10
+
+
+def test_invalid_nominal_outside_domain_still_rejected(client):
+    # 收缩只救“有效名义点”：名义点本身在定义域外（asin(1.0001)）时，
+    # GUM 与反求仍按原语义 422 拒绝（PropagationError）。
+    model = {
+        "version": "pb-asin-outside",
+        "expression": "1 + asin(x)",
+        "inputs": [
+            {"name": "x", "value": 1.0001, "unit": "dimensionless",
+             "standard_uncertainty": 1e-12, "distribution": "normal"},
+        ],
+        "output_unit": "dimensionless",
+        "correlations": [],
+    }
+    _register(client, model)
+    r = _budget(client, "pb-asin-outside", "x", 1e-5)
+    assert r.status_code == 422
+    assert r.json()["error"] == "PropagationError"
+    ev = client.post("/api/v1/evaluations", json={
+        "model_version": "pb-asin-outside",
+        "inputs": model["inputs"], "correlations": [],
+        "n": 2000, "seed": 1, "idempotency_key": "pb-asin-outside-1",
+    })
+    assert ev.status_code == 422
+    assert ev.json()["error"] == "PropagationError"
+
+
+# ---------------------------------------------------------------------------
 # 只读语义：不改模型、不写计算记录；既有功能不受影响
 # ---------------------------------------------------------------------------
 
